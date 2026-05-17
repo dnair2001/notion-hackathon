@@ -418,7 +418,7 @@ worker.sync("classFinderSync", {
 							url: result.url,
 							formats: ["json"],
 							jsonOptions: {
-								prompt: `Extract up to 5 specific ${classType} classes happening in the next 7 days that are bookable. For each: class name, studio name, day + time, AND the direct ClassPass booking URL (the href link to that specific class or studio page on classpass.com).`,
+								prompt: `Extract up to 5 specific ${classType} classes happening in the next 7 days that are bookable. For each: class name, studio name, the day of the week the class is on (just the day name like 'Sunday' or 'Monday' — DO NOT include a time), AND the direct ClassPass booking URL (the href link to that specific class or studio page on classpass.com).`,
 								schema: {
 									type: "object",
 									properties: {
@@ -429,7 +429,7 @@ worker.sync("classFinderSync", {
 												properties: {
 													name: { type: "string" },
 													studio: { type: "string" },
-													time: { type: "string", description: "Day and time, e.g. 'Wednesday 7:00 PM' or 'Tomorrow 6:30 AM'" },
+													time: { type: "string", description: "Day of the week only, e.g. 'Sunday' or 'Wednesday'. Do not include any time of day." },
 													bookingUrl: { type: "string", description: "Direct classpass.com URL to book this class or its studio page" },
 												},
 												required: ["name", "studio", "time", "bookingUrl"],
@@ -479,7 +479,13 @@ worker.sync("classFinderSync", {
 
 					for (let j = 0; j < extractedClasses.length; j++) {
 						const cls = extractedClasses[j];
-						const key = `${classType}-${cls.studio}-${cls.time}`
+						// Keep only the day-of-week (drop any time-of-day the AI tries to sneak in)
+						const dayOnly = (() => {
+							const raw = (cls.time ?? "").toString();
+							const match = raw.match(/\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b/i);
+							return match ? match[1].charAt(0).toUpperCase() + match[1].slice(1).toLowerCase() : "";
+						})();
+						const key = `${classType}-${cls.studio}-${dayOnly}`
 							.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 80);
 						// Prefer the specific class URL extracted by AI; fall back to the listing
 						const classUrl = (cls.bookingUrl && cls.bookingUrl.includes("classpass.com"))
@@ -489,10 +495,10 @@ worker.sync("classFinderSync", {
 							id: key,
 							name: `${cls.name} @ ${cls.studio}`,
 							type: formatClassType(classType),
-							description: `${cls.studio} — ${cls.time}`,
+							description: dayOnly ? `${cls.studio} — ${dayOnly}` : cls.studio,
 							url: classUrl,
 							studio: cls.studio ?? "",
-							classTime: cls.time ?? "",
+							classTime: dayOnly,
 							mindbodyClassId: "",
 							mindbodySiteId: "",
 						});
