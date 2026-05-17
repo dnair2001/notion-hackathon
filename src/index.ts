@@ -2,6 +2,7 @@ import { Worker } from "@notionhq/workers";
 import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
+import { Stagehand } from "@browserbasehq/stagehand";
 
 const worker = new Worker();
 export default worker;
@@ -70,6 +71,8 @@ const recommendations = worker.database("recommendations", {
 				{ name: "Other", color: "gray" },
 			]),
 			URL: Schema.url(),
+			Studio: Schema.richText(),
+			"Class Time": Schema.richText(),
 			"Mindbody Class ID": Schema.richText(),
 			"Mindbody Site ID": Schema.richText(),
 			Status: Schema.select([
@@ -288,6 +291,8 @@ worker.sync("classFinderSync", {
 			type: string;
 			description: string;
 			url: string;
+			studio: string;
+			classTime: string;
 			mindbodyClassId: string;
 			mindbodySiteId: string;
 		}[] = [];
@@ -312,6 +317,8 @@ worker.sync("classFinderSync", {
 						type: mappedType,
 						description: cls.ClassDescription?.Description ?? "",
 						url: `https://www.mindbodyonline.com/explore/studios/${siteId}`,
+						studio: cls.Location?.Name ?? "",
+						classTime: cls.StartDateTime ?? "",
 						mindbodyClassId: classId,
 						mindbodySiteId: siteId,
 					});
@@ -320,11 +327,12 @@ worker.sync("classFinderSync", {
 			console.log(`Found ${allRecs.length} Mindbody classes.`);
 		}
 
-		// Fill remaining slots via Firecrawl web search
+		// Fill remaining slots via Firecrawl — search ClassPass, then scrape each result
+		// with AI extraction to get SPECIFIC classes with times this week.
 		if (firecrawlApiKey) {
 			for (const classType of classTypes) {
 				await firecrawlApi.wait();
-				const query = `${classType} classes in ${location} book online this week`;
+				const query = `${classType} class ${location} this week schedule site:classpass.com`;
 
 				const searchRes = await fetch("https://api.firecrawl.dev/v1/search", {
 					method: "POST",
@@ -332,28 +340,111 @@ worker.sync("classFinderSync", {
 						Authorization: `Bearer ${firecrawlApiKey}`,
 						"Content-Type": "application/json",
 					},
-					body: JSON.stringify({ query, limit: 5 }),
+					body: JSON.stringify({ query, limit: 3 }),
 				});
 
 				if (!searchRes.ok) {
-					console.warn(`Firecrawl error for "${classType}": ${searchRes.status}`);
+					console.warn(`Firecrawl search error for "${classType}": ${searchRes.status}`);
 					continue;
 				}
 
 				const { data = [] } = await searchRes.json();
 
+				// For each ClassPass page, scrape + AI-extract specific classes
 				for (let i = 0; i < data.length; i++) {
 					const result = data[i];
-					if (!result.url || !result.title) continue;
-					allRecs.push({
-						id: `fc-${classType}-${i}`,
-						name: result.title,
-						type: formatClassType(classType),
-						description: result.description ?? "",
-						url: result.url,
-						mindbodyClassId: "",
-						mindbodySiteId: "",
+					if (!result.url || !result.url.includes("classpass.com")) continue;
+
+					await firecrawlApi.wait();
+					const scrapeRes = await fetch("https://api.firecrawl.dev/v1/scrape", {
+						method: "POST",
+						headers: {
+							Authorization: `Bearer ${firecrawlApiKey}`,
+							"Content-Type": "application/json",
+						},
+						body: JSON.stringify({
+							url: result.url,
+							formats: ["json"],
+							jsonOptions: {
+								prompt: `Extract up to 5 specific ${classType} classes happening in the next 7 days that are bookable. For each: class name, studio name, day + time, AND the direct ClassPass booking URL (the href link to that specific class or studio page on classpass.com).`,
+								schema: {
+									type: "object",
+									properties: {
+										classes: {
+											type: "array",
+											items: {
+												type: "object",
+												properties: {
+													name: { type: "string" },
+													studio: { type: "string" },
+													time: { type: "string", description: "Day and time, e.g. 'Wednesday 7:00 PM' or 'Tomorrow 6:30 AM'" },
+													bookingUrl: { type: "string", description: "Direct classpass.com URL to book this class or its studio page" },
+												},
+												required: ["name", "studio", "time", "bookingUrl"],
+											},
+										},
+									},
+									required: ["classes"],
+								},
+							},
+						}),
 					});
+
+					if (!scrapeRes.ok) {
+						console.warn(`Firecrawl scrape error for ${result.url}: ${scrapeRes.status}`);
+						// Fall back to storing the general listing
+						allRecs.push({
+							id: `fc-${classType}-${i}`,
+							name: result.title ?? "ClassPass result",
+							type: formatClassType(classType),
+							description: result.description ?? "",
+							url: result.url,
+							studio: "",
+							classTime: "",
+							mindbodyClassId: "",
+							mindbodySiteId: "",
+						});
+						continue;
+					}
+
+					const scraped = await scrapeRes.json();
+					const extractedClasses = scraped?.data?.json?.classes ?? [];
+
+					if (extractedClasses.length === 0) {
+						allRecs.push({
+							id: `fc-${classType}-${i}`,
+							name: result.title ?? "ClassPass result",
+							type: formatClassType(classType),
+							description: result.description ?? "",
+							url: result.url,
+							studio: "",
+							classTime: "",
+							mindbodyClassId: "",
+							mindbodySiteId: "",
+						});
+						continue;
+					}
+
+					for (let j = 0; j < extractedClasses.length; j++) {
+						const cls = extractedClasses[j];
+						const key = `${classType}-${cls.studio}-${cls.time}`
+							.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 80);
+						// Prefer the specific class URL extracted by AI; fall back to the listing
+						const classUrl = (cls.bookingUrl && cls.bookingUrl.includes("classpass.com"))
+							? cls.bookingUrl
+							: result.url;
+						allRecs.push({
+							id: key,
+							name: `${cls.name} @ ${cls.studio}`,
+							type: formatClassType(classType),
+							description: `${cls.studio} — ${cls.time}`,
+							url: classUrl,
+							studio: cls.studio ?? "",
+							classTime: cls.time ?? "",
+							mindbodyClassId: "",
+							mindbodySiteId: "",
+						});
+					}
 				}
 			}
 		}
@@ -370,6 +461,8 @@ worker.sync("classFinderSync", {
 					Description: Builder.richText(rec.description),
 					"Class Type": Builder.select(rec.type),
 					URL: Builder.url(rec.url),
+					Studio: Builder.richText(rec.studio),
+					"Class Time": Builder.richText(rec.classTime),
 					"Mindbody Class ID": Builder.richText(rec.mindbodyClassId),
 					"Mindbody Site ID": Builder.richText(rec.mindbodySiteId),
 					Status: Builder.select("Available"),
@@ -388,11 +481,12 @@ worker.tool("getFitnessStatus", {
 	title: "Get My Fitness Status",
 	description:
 		"Check how many workouts you've completed this week versus your goal. Returns recent activities and whether class recommendations are waiting in Notion.",
-	// The Notion agent always injects these three system fields into every tool call.
 	schema: j.object({
 		name: j.string().nullable(),
 		namespace: j.string().nullable(),
 		autofixedJson: j.string().nullable(),
+		connectionName: j.string().nullable(),
+		isCustomToolCall: j.boolean().nullable(),
 	}),
 	execute: async () => {
 		const weeklyGoal = parseInt(process.env.WEEKLY_GOAL ?? "3", 10);
@@ -428,6 +522,57 @@ worker.tool("getFitnessStatus", {
 	},
 });
 
+// Returns the list of current class recommendations in Notion.
+// Use this so the agent can show the user what's available before booking.
+worker.tool("listRecommendations", {
+	title: "List Class Recommendations",
+	description:
+		"List the current fitness class recommendations from the user's Notion Class Recommendations database. Use when the user asks what classes are recommended, available, or what they should book.",
+	schema: j.object({
+		name: j.string().nullable(),
+		namespace: j.string().nullable(),
+		autofixedJson: j.string().nullable(),
+		connectionName: j.string().nullable(),
+		isCustomToolCall: j.boolean().nullable(),
+	}),
+	execute: async (_input, { notion }) => {
+		const searchRes = await notion.search({
+			query: "Class Recommendations",
+			filter: { value: "data_source", property: "object" },
+		});
+
+		const db = searchRes.results.find(
+			(r: any) => r.object === "data_source" && r.title?.[0]?.plain_text?.includes("Class Recommendations"),
+		) as any;
+
+		if (!db) {
+			return "Could not find the Class Recommendations database. Run classFinderSync first to populate it.";
+		}
+
+		const queryRes = await notion.dataSources.query({
+			data_source_id: db.id,
+			page_size: 20,
+		});
+
+		if (queryRes.results.length === 0) {
+			return "No class recommendations yet. Run classFinderSync to find some.";
+		}
+
+		const lines = queryRes.results.map((row: any) => {
+			const name = row.properties.Name?.title?.[0]?.plain_text ?? "Untitled";
+			const type = row.properties["Class Type"]?.select?.name ?? "";
+			const time = row.properties["Class Time"]?.rich_text?.[0]?.plain_text ?? "";
+			const studio = row.properties.Studio?.rich_text?.[0]?.plain_text ?? "";
+			const status = row.properties.Status?.select?.name ?? "Available";
+			const url = row.properties.URL?.url ?? "";
+			const meta = [type, time, studio].filter(Boolean).join(" · ");
+			return `• ${name}${meta ? `\n  ${meta}` : ""} — ${status}${url ? `\n  ${url}` : ""}`;
+		});
+
+		return `Here are your current class recommendations:\n\n${lines.join("\n")}`;
+	},
+});
+
 // Marks a class from the recommendations database as Booked in Notion.
 // Called by the agent when the user picks a class they want to attend.
 worker.tool("bookClass", {
@@ -439,6 +584,8 @@ worker.tool("bookClass", {
 		name: j.string().nullable(),
 		namespace: j.string().nullable(),
 		autofixedJson: j.string().nullable(),
+		connectionName: j.string().nullable(),
+		isCustomToolCall: j.boolean().nullable(),
 	}),
 	execute: async ({ className }, { notion }) => {
 		// Find the Class Recommendations database by title
@@ -471,40 +618,83 @@ worker.tool("bookClass", {
 		const page = queryRes.results[0] as any;
 		const pageTitle = page.properties.Name?.title?.[0]?.plain_text ?? className;
 		const url = page.properties.URL?.url ?? "";
-		const mindbodyClassId = page.properties["Mindbody Class ID"]?.rich_text?.[0]?.plain_text ?? "";
-		const mindbodySiteId = page.properties["Mindbody Site ID"]?.rich_text?.[0]?.plain_text ?? "";
 
-		const mindbodyApiKey = process.env.MINDBODY_API_KEY ?? "";
-		const mindbodyUsername = process.env.MINDBODY_USERNAME ?? "";
-		const mindbodyPassword = process.env.MINDBODY_PASSWORD ?? "";
-
+		// Attempt real booking via Browserbase + Stagehand (AI-powered browser)
 		let bookingResult = "";
-		if (mindbodyClassId && mindbodySiteId && mindbodyApiKey && mindbodyUsername && mindbodyPassword) {
+		if (url && process.env.BROWSERBASE_API_KEY && process.env.BROWSERBASE_PROJECT_ID) {
+			const stagehand = new Stagehand({
+				env: "BROWSERBASE",
+				apiKey: process.env.BROWSERBASE_API_KEY,
+				projectId: process.env.BROWSERBASE_PROJECT_ID,
+				model: {
+					modelName: "anthropic/claude-sonnet-4-6",
+					apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+				},
+				verbose: 0,
+			});
+
 			try {
-				await mindbodyApi.wait();
-				const token = await mindbodyIssueToken(mindbodyApiKey, mindbodySiteId, mindbodyUsername, mindbodyPassword);
-				await mindbodyApi.wait();
-				const clientId = await mindbodyGetClientId(mindbodyApiKey, mindbodySiteId, token);
-				await mindbodyApi.wait();
-				bookingResult = await mindbodyBookClass(mindbodyApiKey, mindbodySiteId, token, mindbodyClassId, clientId);
+				await stagehand.init();
+
+				// Always start at ClassPass — use the stored URL if it's already a ClassPass URL,
+				// otherwise search ClassPass for this class
+				const isClassPassUrl = url.includes("classpass.com");
+				const startUrl = isClassPassUrl
+					? url
+					: `https://classpass.com/search?query=${encodeURIComponent(pageTitle)}`;
+
+				await stagehand.context.activePage()?.goto(startUrl, { waitUntil: "domcontentloaded" });
+
+				// Dismiss any popups/modals that block the page (cookie banners, newsletter prompts,
+				// location asks, free-trial upsells, etc.)
+				await stagehand.act(
+					"close any visible popups, modals, cookie banners, or overlays by clicking their X, Close, Dismiss, No thanks, Maybe later, or Decline buttons. Only close them — do not click any sign-up or subscribe buttons.",
+				);
+
+				// Log in to ClassPass first (so we can actually book)
+				const bookingEmail = process.env.BOOKING_EMAIL ?? "";
+				const bookingPassword = process.env.BOOKING_PASSWORD ?? "";
+				if (bookingEmail) {
+					await stagehand.act(
+						`click the Log In or Sign In button if visible, then enter email "${bookingEmail}" and password "${bookingPassword}" and submit the form`,
+					);
+					// Close any popups that appear post-login
+					await stagehand.act("close any popups, modals, or overlays that appeared after logging in");
+				}
+
+				// Find a specific class with an available time this week and book it
+				await stagehand.act(
+					"find a specific class happening today or this week that has available spots, click into it, and click Reserve or Book. Ignore and close any popups that appear during this process.",
+				);
+				await stagehand.act("close any popups that appeared, then confirm the reservation — stop before any payment step");
+
+				const confirmation = await stagehand.extract(
+					"the booked class name, studio, date, and time as shown on the confirmation page",
+				);
+
+				bookingResult = confirmation
+					? `Booked on ClassPass: ${JSON.stringify(confirmation)}`
+					: "Reservation attempted on ClassPass — check your account to confirm.";
 			} catch (err: any) {
-				bookingResult = `Mindbody booking failed: ${err?.message ?? "unknown error"}.${url ? ` Book manually at ${url}.` : ""}`;
+				bookingResult = `Browser booking failed (${err?.message ?? "unknown error"}). Use the link below to book manually.`;
+			} finally {
+				await stagehand.close();
 			}
-		} else if (!mindbodyClassId) {
-			bookingResult = url
-				? `This studio isn't on Mindbody — book at ${url}.`
-				: "This studio isn't on Mindbody and no booking URL is on file.";
-		} else {
-			bookingResult = "Set MINDBODY_API_KEY, MINDBODY_USERNAME, MINDBODY_PASSWORD in .env to enable real booking.";
+		} else if (url) {
+			bookingResult = `Set BROWSERBASE_API_KEY to enable real booking. For now, book manually at: ${url}`;
 		}
 
-		// Update Status to Booked in Notion
-		await notion.pages.update({
-			page_id: page.id,
-			properties: {
-				Status: { select: { name: "Booked" } },
-			},
-		});
+		// Update Status to Booked in Notion (best-effort — fails if the sync owns the property)
+		try {
+			await notion.pages.update({
+				page_id: page.id,
+				properties: {
+					Status: { select: { name: "Booked" } },
+				},
+			});
+		} catch (err) {
+			console.warn("Could not update Notion status (managed by sync):", (err as any)?.message);
+		}
 
 		return [
 			`"${pageTitle}" is marked as Booked in your Notion recommendations.`,
