@@ -3,6 +3,7 @@ import * as Builder from "@notionhq/workers/builder";
 import * as Schema from "@notionhq/workers/schema";
 import { j } from "@notionhq/workers/schema-builder";
 import { Stagehand } from "@browserbasehq/stagehand";
+import { z } from "zod";
 
 const worker = new Worker();
 export default worker;
@@ -485,8 +486,6 @@ worker.tool("getFitnessStatus", {
 		name: j.string().nullable(),
 		namespace: j.string().nullable(),
 		autofixedJson: j.string().nullable(),
-		connectionName: j.string().nullable(),
-		isCustomToolCall: j.boolean().nullable(),
 	}),
 	execute: async () => {
 		const weeklyGoal = parseInt(process.env.WEEKLY_GOAL ?? "3", 10);
@@ -532,8 +531,6 @@ worker.tool("listRecommendations", {
 		name: j.string().nullable(),
 		namespace: j.string().nullable(),
 		autofixedJson: j.string().nullable(),
-		connectionName: j.string().nullable(),
-		isCustomToolCall: j.boolean().nullable(),
 	}),
 	execute: async (_input, { notion }) => {
 		const searchRes = await notion.search({
@@ -584,8 +581,6 @@ worker.tool("bookClass", {
 		name: j.string().nullable(),
 		namespace: j.string().nullable(),
 		autofixedJson: j.string().nullable(),
-		connectionName: j.string().nullable(),
-		isCustomToolCall: j.boolean().nullable(),
 	}),
 	execute: async ({ className }, { notion }) => {
 		// Find the Class Recommendations database by title
@@ -619,13 +614,18 @@ worker.tool("bookClass", {
 		const pageTitle = page.properties.Name?.title?.[0]?.plain_text ?? className;
 		const url = page.properties.URL?.url ?? "";
 
-		// Attempt real booking via Browserbase + Stagehand (AI-powered browser)
+		// Attempt real booking via Browserbase + Stagehand (using pre-authenticated context)
 		let bookingResult = "";
+		const contextId = process.env.BROWSERBASE_CONTEXT_ID;
 		if (url && process.env.BROWSERBASE_API_KEY && process.env.BROWSERBASE_PROJECT_ID) {
 			const stagehand = new Stagehand({
 				env: "BROWSERBASE",
 				apiKey: process.env.BROWSERBASE_API_KEY,
 				projectId: process.env.BROWSERBASE_PROJECT_ID,
+				// Load the persistent ClassPass-logged-in context if set
+				browserbaseSessionCreateParams: contextId
+					? { browserSettings: { context: { id: contextId, persist: true } } }
+					: undefined,
 				model: {
 					modelName: "anthropic/claude-sonnet-4-6",
 					apiKey: process.env.ANTHROPIC_API_KEY ?? "",
@@ -636,8 +636,6 @@ worker.tool("bookClass", {
 			try {
 				await stagehand.init();
 
-				// Always start at ClassPass — use the stored URL if it's already a ClassPass URL,
-				// otherwise search ClassPass for this class
 				const isClassPassUrl = url.includes("classpass.com");
 				const startUrl = isClassPassUrl
 					? url
@@ -645,36 +643,51 @@ worker.tool("bookClass", {
 
 				await stagehand.context.activePage()?.goto(startUrl, { waitUntil: "domcontentloaded" });
 
-				// Dismiss any popups/modals that block the page (cookie banners, newsletter prompts,
-				// location asks, free-trial upsells, etc.)
-				await stagehand.act(
-					"close any visible popups, modals, cookie banners, or overlays by clicking their X, Close, Dismiss, No thanks, Maybe later, or Decline buttons. Only close them — do not click any sign-up or subscribe buttons.",
-				);
+				// Step 1 — close popups/banners
+				await stagehand.act("close any popups, banners, modals, or cookie consent overlays on the page");
 
-				// Log in to ClassPass first (so we can actually book)
-				const bookingEmail = process.env.BOOKING_EMAIL ?? "";
-				const bookingPassword = process.env.BOOKING_PASSWORD ?? "";
-				if (bookingEmail) {
-					await stagehand.act(
-						`click the Log In or Sign In button if visible, then enter email "${bookingEmail}" and password "${bookingPassword}" and submit the form`,
+				// Step 2 — scroll down to bring the class schedule into view
+				await stagehand.act("scroll down on the page until the class schedule with times is fully visible");
+
+				// Step 3 — try up to 7 days to find a bookable class
+				let booked = false;
+				let bookedTime = "";
+
+				for (let day = 0; day < 7 && !booked; day++) {
+					const availability = await stagehand.extract(
+						"look at the visible class schedule. Return whether any class has an active Reserve, Book, or similar booking button (not greyed out, not Waitlist, not Full). If yes, return the time of the earliest available one.",
+						z.object({
+							hasAvailableClass: z.boolean(),
+							firstAvailableTime: z.string().nullable(),
+						}),
 					);
-					// Close any popups that appear post-login
-					await stagehand.act("close any popups, modals, or overlays that appeared after logging in");
+
+					if (availability.hasAvailableClass && availability.firstAvailableTime) {
+						await stagehand.act(
+							`click the Reserve or Book button for the class at ${availability.firstAvailableTime}`,
+						);
+						await stagehand.act(
+							"if a confirmation dialog or modal appears asking to confirm the reservation, click Confirm or Yes — but do not enter any payment information",
+						);
+						booked = true;
+						bookedTime = availability.firstAvailableTime;
+					} else {
+						await stagehand.act(
+							"click the next-day arrow, right arrow, or button to advance the schedule to the following day",
+						);
+						await new Promise((r) => setTimeout(r, 1500));
+					}
 				}
 
-				// Find a specific class with an available time this week and book it
-				await stagehand.act(
-					"find a specific class happening today or this week that has available spots, click into it, and click Reserve or Book. Ignore and close any popups that appear during this process.",
-				);
-				await stagehand.act("close any popups that appeared, then confirm the reservation — stop before any payment step");
-
-				const confirmation = await stagehand.extract(
-					"the booked class name, studio, date, and time as shown on the confirmation page",
-				);
-
-				bookingResult = confirmation
-					? `Booked on ClassPass: ${JSON.stringify(confirmation)}`
-					: "Reservation attempted on ClassPass — check your account to confirm.";
+				// Step 4 — extract confirmation details
+				if (booked) {
+					const confirmation = await stagehand.extract(
+						"the confirmation details: class name, studio, date, and time. If there is no explicit confirmation page, return the details from the reserved class.",
+					);
+					bookingResult = `Booked on ClassPass at ${bookedTime}: ${JSON.stringify(confirmation)}`;
+				} else {
+					bookingResult = "Couldn't find an available class in the next 7 days — all slots may be booked or waitlist-only.";
+				}
 			} catch (err: any) {
 				bookingResult = `Browser booking failed (${err?.message ?? "unknown error"}). Use the link below to book manually.`;
 			} finally {
