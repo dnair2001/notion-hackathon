@@ -99,11 +99,11 @@ const mindbodyApi = worker.pacer("mindbodyApi", { allowedRequests: 10, intervalM
 
 const SPORT_TYPE_MAP: Record<string, string> = {
 	Run: "Run", TrailRun: "Run", VirtualRun: "Run",
-	Ride: "Ride", VirtualRide: "Ride", EBikeRide: "Ride",
+	Ride: "Ride", VirtualRide: "Ride", EBikeRide: "Ride", MountainBikeRide: "Ride", GravelRide: "Ride",
 	Swim: "Swim",
 	WeightTraining: "WeightTraining",
 	Yoga: "Yoga",
-	Workout: "Workout", Crossfit: "Workout", HIITWorkout: "Workout",
+	Workout: "Workout", Crossfit: "Workout", HIITWorkout: "Workout", HighIntensityIntervalTraining: "Workout",
 	Walk: "Walk",
 	Hike: "Hike",
 };
@@ -131,6 +131,45 @@ function weekStartTimestamp(): number {
 	d.setDate(d.getDate() - d.getDay()); // rewind to Sunday
 	d.setHours(0, 0, 0, 0);
 	return Math.floor(d.getTime() / 1000);
+}
+
+// Suggests complementary class types based on what the user has been doing.
+// E.g. lots of cardio → recommend strength + yoga; lots of intense work → favor recovery.
+function suggestComplementaryClasses(activities: any[], defaults: string[]): { types: string[]; reason: string } {
+	if (activities.length === 0) {
+		return { types: defaults, reason: "no recent activity — using your default class types" };
+	}
+
+	let cardio = 0, strength = 0, flexibility = 0, mixed = 0;
+	for (const a of activities) {
+		const sport = a.sport_type ?? a.type ?? "";
+		if (["Run", "TrailRun", "VirtualRun", "Ride", "VirtualRide", "EBikeRide", "Walk", "Hike", "Swim"].includes(sport)) cardio++;
+		else if (sport === "WeightTraining") strength++;
+		else if (sport === "Yoga") flexibility++;
+		else if (["Workout", "Crossfit", "HIITWorkout", "HighIntensityIntervalTraining"].includes(sport)) mixed++;
+	}
+
+	const total = activities.length;
+	const intense = cardio + mixed; // high-intensity sessions
+
+	// Overworked → favor recovery
+	if (total >= 4 && flexibility === 0) {
+		return { types: ["yoga", "pilates", "barre"], reason: `${total} recent workouts — prioritizing recovery` };
+	}
+	// Cardio-heavy, no strength → add strength
+	if (cardio >= 2 && strength === 0) {
+		return { types: ["strength", "yoga", "pilates"], reason: `${cardio} cardio sessions — adding strength + recovery` };
+	}
+	// Strength-heavy, no cardio → add cardio
+	if (strength >= 2 && cardio === 0) {
+		return { types: ["spin", "HIIT", "yoga"], reason: `${strength} strength sessions — adding cardio + recovery` };
+	}
+	// Intense work, no recovery → add yoga
+	if (intense >= 2 && flexibility === 0) {
+		return { types: ["yoga", "pilates", "barre"], reason: `${intense} intense sessions — adding recovery work` };
+	}
+	// Balanced or unclear → use defaults
+	return { types: defaults, reason: "balanced activity — using your default class types" };
 }
 
 // --- Mindbody helpers ---
@@ -254,7 +293,7 @@ worker.sync("classFinderSync", {
 	schedule: "1d",
 	execute: async () => {
 		const location = process.env.LOCATION ?? "San Francisco, CA";
-		const classTypes = (process.env.CLASS_TYPES ?? "yoga,HIIT,spin")
+		const defaultTypes = (process.env.CLASS_TYPES ?? "yoga,HIIT,spin")
 			.split(",")
 			.map((s) => s.trim())
 			.filter(Boolean)
@@ -266,20 +305,32 @@ worker.sync("classFinderSync", {
 			throw new Error("Set at least one of FIRECRAWL_API_KEY or MINDBODY_API_KEY to find classes.");
 		}
 
-		// Count this week's Strava activities
+		// Fetch the last 14 days of Strava activities — gives us enough history
+		// to suggest complementary class types, plus this week's count vs goal.
 		const token = await stravaAuth.accessToken();
+		const fourteenDaysAgo = Math.floor((Date.now() - 14 * 24 * 60 * 60 * 1000) / 1000);
 		await stravaApi.wait();
-		const weekRes = await fetch(
-			`https://www.strava.com/api/v3/athlete/activities?after=${weekStartTimestamp()}&per_page=100`,
+		const activityRes = await fetch(
+			`https://www.strava.com/api/v3/athlete/activities?after=${fourteenDaysAgo}&per_page=100`,
 			{ headers: { Authorization: `Bearer ${token}` } },
 		);
-		if (!weekRes.ok) throw new Error(`Strava error: ${weekRes.status}`);
+		if (!activityRes.ok) throw new Error(`Strava error: ${activityRes.status}`);
 
-		const weekActivities: any[] = await weekRes.json();
+		const recentActivities: any[] = await activityRes.json();
+		const weekStartSec = weekStartTimestamp();
+		const weekActivities = recentActivities.filter(
+			(a) => Math.floor(new Date(a.start_date).getTime() / 1000) >= weekStartSec,
+		);
 		const count = weekActivities.length;
 		const needed = Math.max(0, weeklyGoal - count);
 
+		// Smart cross-training: analyze the full 14 days for type balance
+		const suggestion = suggestComplementaryClasses(recentActivities, defaultTypes);
+		const classTypes = suggestion.types.slice(0, 3);
+
 		console.log(`This week: ${count}/${weeklyGoal} workouts. Need ${needed} more.`);
+		console.log(`Last 14 days: ${recentActivities.length} activities.`);
+		console.log(`Recommending ${classTypes.join(", ")} — ${suggestion.reason}`);
 
 		if (needed === 0) {
 			console.log("Goal achieved — clearing stale recommendations.");
@@ -567,6 +618,113 @@ worker.tool("listRecommendations", {
 		});
 
 		return `Here are your current class recommendations:\n\n${lines.join("\n")}`;
+	},
+});
+
+// Generates a markdown recap of the user's week: workouts done, totals, comparison
+// to last week, and booked classes. Called by the agent on prompts like "how was my week?"
+worker.tool("getWeeklySummary", {
+	title: "Get Weekly Fitness Summary",
+	description:
+		"Generate a markdown summary of the user's week: total workouts, distance, duration, activity breakdown, comparison to last week, and any classes they have booked. Use when the user asks for a recap, summary, weekly review, or how their week was.",
+	schema: j.object({
+		name: j.string().nullable(),
+		namespace: j.string().nullable(),
+		autofixedJson: j.string().nullable(),
+	}),
+	execute: async (_input, { notion }) => {
+		const token = await stravaAuth.accessToken();
+		const now = Math.floor(Date.now() / 1000);
+		const twoWeeksAgo = now - 14 * 24 * 60 * 60;
+		const thisWeekStart = weekStartTimestamp();
+		const lastWeekStart = thisWeekStart - 7 * 24 * 60 * 60;
+
+		const res = await fetch(
+			`https://www.strava.com/api/v3/athlete/activities?after=${twoWeeksAgo}&per_page=100`,
+			{ headers: { Authorization: `Bearer ${token}` } },
+		);
+		if (!res.ok) throw new Error(`Strava error: ${res.status}`);
+		const activities: any[] = await res.json();
+
+		function bucket(start: number, end: number) {
+			const list = activities.filter((a) => {
+				const ts = Math.floor(new Date(a.start_date).getTime() / 1000);
+				return ts >= start && ts < end;
+			});
+			const totalMin = list.reduce((s, a) => s + (a.moving_time ?? 0), 0) / 60;
+			const totalKm = list.reduce((s, a) => s + (a.distance ?? 0), 0) / 1000;
+			const byType: Record<string, number> = {};
+			for (const a of list) {
+				const t = SPORT_TYPE_MAP[a.sport_type ?? a.type] ?? "Other";
+				byType[t] = (byType[t] ?? 0) + 1;
+			}
+			return { count: list.length, totalMin: Math.round(totalMin), totalKm: Math.round(totalKm * 10) / 10, byType };
+		}
+
+		const thisWeek = bucket(thisWeekStart, now + 1);
+		const lastWeek = bucket(lastWeekStart, thisWeekStart);
+		const weeklyGoal = parseInt(process.env.WEEKLY_GOAL ?? "3", 10);
+
+		// Get booked classes from Notion
+		let bookedClasses: string[] = [];
+		try {
+			const searchRes = await notion.search({
+				query: "Class Recommendations",
+				filter: { value: "data_source", property: "object" },
+			});
+			const db = searchRes.results.find(
+				(r: any) => r.object === "data_source" && r.title?.[0]?.plain_text?.includes("Class Recommendations"),
+			) as any;
+			if (db) {
+				const queryRes = await notion.dataSources.query({
+					data_source_id: db.id,
+					filter: { property: "Status", select: { equals: "Booked" } },
+					page_size: 10,
+				});
+				bookedClasses = queryRes.results.map((row: any) => {
+					const name = row.properties.Name?.title?.[0]?.plain_text ?? "Untitled";
+					const time = row.properties["Class Time"]?.rich_text?.[0]?.plain_text ?? "";
+					return time ? `${name} (${time})` : name;
+				});
+			}
+		} catch (err) {
+			console.warn("Could not fetch booked classes:", (err as any)?.message);
+		}
+
+		// Build markdown summary
+		const lines: string[] = [];
+		lines.push(`# 📊 Your Week\n`);
+		lines.push(`**${thisWeek.count}/${weeklyGoal} workouts** completed`);
+		if (thisWeek.count > 0) {
+			lines.push(`- ⏱ Total time: ${thisWeek.totalMin} min`);
+			if (thisWeek.totalKm > 0) lines.push(`- 🏃 Total distance: ${thisWeek.totalKm} km`);
+			const types = Object.entries(thisWeek.byType).map(([t, n]) => `${n} ${t}`).join(", ");
+			if (types) lines.push(`- 🏷 Breakdown: ${types}`);
+		}
+
+		lines.push(`\n## vs Last Week`);
+		const diff = thisWeek.count - lastWeek.count;
+		const trend = diff > 0 ? `📈 up ${diff}` : diff < 0 ? `📉 down ${Math.abs(diff)}` : "➡️ same";
+		lines.push(`- Workouts: ${trend} (last week: ${lastWeek.count})`);
+		if (lastWeek.totalMin > 0) {
+			const minDiff = thisWeek.totalMin - lastWeek.totalMin;
+			lines.push(`- Time: ${minDiff >= 0 ? "+" : ""}${minDiff} min vs last week`);
+		}
+
+		if (bookedClasses.length > 0) {
+			lines.push(`\n## 📅 Classes Booked`);
+			bookedClasses.forEach((c) => lines.push(`- ${c}`));
+		}
+
+		if (thisWeek.count >= weeklyGoal) {
+			lines.push(`\n🎉 You crushed your goal this week!`);
+		} else if (thisWeek.count === 0) {
+			lines.push(`\n💪 New week, fresh start. Check your Class Recommendations to get going.`);
+		} else {
+			lines.push(`\n💪 ${weeklyGoal - thisWeek.count} more to hit your goal.`);
+		}
+
+		return lines.join("\n");
 	},
 });
 
